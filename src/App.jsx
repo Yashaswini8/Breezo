@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   AlertTriangle,
@@ -33,6 +33,8 @@ import {
   buildTips,
   climateRisk,
   loadAirData,
+  normaliseQuery,
+  searchCities,
 } from './utils'
 
 const CARD =
@@ -104,8 +106,7 @@ function AqiCard({ data, info }) {
         <div className="pb-1">
           <p className="text-sm font-semibold text-[#0F172A]">US AQI right now</p>
           <p className="text-xs text-slate-500">
-            {data.place.name}
-            {data.place.country ? `, ${data.place.country}` : ''}
+            {[data.place.name, data.place.state, data.place.country].filter(Boolean).join(', ')}
           </p>
         </div>
       </div>
@@ -375,12 +376,60 @@ function AlertBanner({ data, info }) {
   )
 }
 
+function SuggestionList({ results, searching, onPick }) {
+  return (
+    <div className="absolute left-0 right-0 top-full z-40 mt-2 overflow-hidden rounded-xl border border-[#E2E8F0] bg-white shadow-[0_6px_16px_rgba(15,23,42,0.08)]">
+      {searching && (
+        <p className="px-4 py-3 text-sm text-slate-500">Searching…</p>
+      )}
+      {!searching && results.length === 0 && (
+        <p className="px-4 py-3 text-sm text-slate-500">No matching places found.</p>
+      )}
+      {!searching && results.length > 0 && (
+        <ul className="max-h-72 overflow-auto py-1">
+          {results.map((r) => (
+            <li key={r.id}>
+              <button
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => onPick(r)}
+                className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-slate-50"
+              >
+                <MapPin size={15} className="shrink-0 text-navy" />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-semibold text-[#0F172A]">
+                    {r.name}
+                  </span>
+                  <span className="block truncate text-xs text-slate-500">
+                    {[r.state, r.country].filter(Boolean).join(', ')}
+                  </span>
+                </span>
+                {r.country === 'India' && (
+                  <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-slate-600">
+                    India
+                  </span>
+                )}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
 export default function App() {
   const [query, setQuery] = useState('')
+  const [results, setResults] = useState([])
+  const [suggestOpen, setSuggestOpen] = useState(false)
+  const [searching, setSearching] = useState(false)
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [profile, setProfile] = useState('General')
+
+  const suppress = useRef(false)
+  const reqId = useRef(0)
 
   const fetchCity = useCallback(async (city) => {
     setLoading(true)
@@ -390,9 +439,10 @@ export default function App() {
       setData(d)
     } catch (e) {
       setData(null)
+      const label = typeof city === 'string' ? city : city?.name || ''
       setError(
         e?.code === 'CITY_NOT_FOUND'
-          ? `We could not find “${city}”. Try a nearby major city like Chennai, Delhi or London.`
+          ? `We could not find “${label}”. Try picking a city from the search list.`
           : 'Something went wrong while loading air data. Please try again.',
       )
     } finally {
@@ -404,10 +454,49 @@ export default function App() {
     fetchCity('Chennai')
   }, [fetchCity])
 
+  // Debounced city suggestions (count=5, India first).
+  useEffect(() => {
+    if (suppress.current) {
+      suppress.current = false
+      setSuggestOpen(false)
+      return
+    }
+    const q = query.trim()
+    if (q.length < 2) {
+      setResults([])
+      setSuggestOpen(false)
+      setSearching(false)
+      return
+    }
+    const id = ++reqId.current
+    setSuggestOpen(true)
+    setSearching(true)
+    const t = setTimeout(async () => {
+      const list = await searchCities(q)
+      if (id !== reqId.current) return // a newer keystroke won
+      setResults(list)
+      setSearching(false)
+      setSuggestOpen(true)
+    }, 300)
+    return () => clearTimeout(t)
+  }, [query])
+
+  const pickPlace = (place) => {
+    suppress.current = true
+    setSuggestOpen(false)
+    setResults([])
+    setQuery(place.name)
+    fetchCity(place)
+  }
+
   const onSearch = (e) => {
     e.preventDefault()
     const city = query.trim()
-    if (city) fetchCity(city)
+    if (!city) return
+    suppress.current = true
+    setSuggestOpen(false)
+    setResults([])
+    fetchCity(normaliseQuery(city))
   }
 
   const info = useMemo(() => aqiInfo(data?.aqi), [data])
@@ -434,24 +523,36 @@ export default function App() {
             </div>
           </div>
 
-          <form onSubmit={onSearch} className="flex w-full max-w-sm items-center gap-2 sm:w-auto">
-            <div className="relative flex-1">
-              <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-              <input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search a city…"
-                aria-label="Search a city"
-                className="w-full rounded-lg border border-[#E2E8F0] bg-white py-2 pl-9 pr-3 text-sm text-[#0F172A] outline-none placeholder:text-slate-400 focus:border-navy"
-              />
+          <form
+            onSubmit={onSearch}
+            className="relative w-full max-w-sm sm:w-auto"
+            onBlur={() => setTimeout(() => setSuggestOpen(false), 120)}
+          >
+            <div className="flex items-center gap-2">
+              <div className="relative flex-1">
+                <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onFocus={() => query.trim().length >= 2 && setSuggestOpen(true)}
+                  placeholder="Search a city…"
+                  aria-label="Search a city"
+                  autoComplete="off"
+                  className="w-full rounded-lg border border-[#E2E8F0] bg-white py-2 pl-9 pr-3 text-sm text-[#0F172A] outline-none placeholder:text-slate-400 focus:border-navy"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={loading}
+                className="rounded-lg bg-navy px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-[#1B3370] disabled:opacity-50"
+              >
+                {loading ? '…' : 'Search'}
+              </button>
             </div>
-            <button
-              type="submit"
-              disabled={loading}
-              className="rounded-lg bg-navy px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-[#1B3370] disabled:opacity-50"
-            >
-              {loading ? '…' : 'Search'}
-            </button>
+
+            {suggestOpen && (
+              <SuggestionList results={results} searching={searching} onPick={pickPlace} />
+            )}
           </form>
         </div>
       </header>
@@ -481,8 +582,7 @@ export default function App() {
             <div className="flex flex-wrap items-center gap-2 text-sm text-slate-500">
               <MapPin size={15} className="text-navy" />
               <span className="font-semibold text-[#0F172A]">
-                {data.place.name}
-                {data.place.country ? `, ${data.place.country}` : ''}
+                {[data.place.name, data.place.state, data.place.country].filter(Boolean).join(', ')}
               </span>
               <span>·</span>
               <span>{data.latitude ? data.latitude.toFixed(2) : ''}</span>

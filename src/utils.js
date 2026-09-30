@@ -1,7 +1,60 @@
 // Breezo — all data + rule-based logic. No API keys, no AI services.
 
-const GEO = (city) =>
-  `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1`
+const GEO = (city, count = 1) =>
+  `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=${count}`
+
+export const SEARCH_COUNT = 5
+
+/** Common nickname / old-name inputs mapped to the name the API knows. */
+const CITY_ALIASES = {
+  bangalore: 'Bengaluru',
+  'bangalore city': 'Bengaluru',
+  'bangalore urban district': 'Bengaluru',
+  blr: 'Bengaluru',
+  bombay: 'Mumbai',
+  madras: 'Chennai',
+  calcutta: 'Kolkata',
+  'new york city': 'New York',
+  nyc: 'New York',
+  'san francisco bay area': 'San Francisco',
+  'delhi ncr': 'Delhi',
+}
+
+export const normaliseQuery = (q) => {
+  const t = (q || '').trim()
+  return CITY_ALIASES[t.toLowerCase()] || t
+}
+
+const toPlace = (r, i = 0) => ({
+  id: `${i}-${r.latitude},${r.longitude}`,
+  name: r.name,
+  state: r.admin1 ?? r.admin2 ?? '',
+  country: r.country ?? '',
+  latitude: r.latitude,
+  longitude: r.longitude,
+})
+
+/** Stable sort that keeps the API's relevance order but floats India to the top. */
+const indiaFirst = (a, b) => {
+  const ia = a.country === 'India' ? 0 : 1
+  const ib = b.country === 'India' ? 0 : 1
+  return ia - ib
+}
+
+/** Up to 5 matching places, India first. Never throws. */
+export async function searchCities(query) {
+  const q = normaliseQuery(query)
+  if (q.length < 2) return []
+  try {
+    const g = await fetch(GEO(q, SEARCH_COUNT))
+    if (!g.ok) return []
+    const gj = await g.json()
+    const list = (gj?.results || []).map(toPlace)
+    return list.sort(indiaFirst).slice(0, SEARCH_COUNT)
+  } catch {
+    return []
+  }
+}
 
 const AIR = (lat, lon) =>
   `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}` +
@@ -157,43 +210,46 @@ function buildMock(city) {
 
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 
-export async function loadAirData(city) {
-  const clean = (city || '').trim() || 'Chennai'
+export async function loadAirData(target) {
   let place = null
-  try {
-    const g = await fetch(GEO(clean))
-    if (!g.ok) throw new Error('geocoding ' + g.status)
-    const gj = await g.json()
-    const r = gj?.results?.[0]
-    if (!r) {
-      const err = new Error('city-not-found')
-      err.code = 'CITY_NOT_FOUND'
-      throw err
+
+  if (target && typeof target === 'object') {
+    // Already resolved by the suggestion dropdown — skip geocoding.
+    place = toPlace(target)
+  } else {
+    const clean = normaliseQuery(target) || 'Chennai'
+    try {
+      const g = await fetch(GEO(clean))
+      if (!g.ok) throw new Error('geocoding ' + g.status)
+      const gj = await g.json()
+      const r = gj?.results?.[0]
+      if (!r) {
+        const err = new Error('city-not-found')
+        err.code = 'CITY_NOT_FOUND'
+        throw err
+      }
+      place = toPlace(r)
+    } catch (e) {
+      if (e.code === 'CITY_NOT_FOUND') throw e
+      place = localPlace(clean)
+      if (!place) return buildMock(clean)
     }
-    place = {
-      name: r.name,
-      country: r.country ?? '',
-      latitude: r.latitude,
-      longitude: r.longitude,
-    }
-  } catch (e) {
-    if (e.code === 'CITY_NOT_FOUND') throw e
-    place = localPlace(clean)
-    if (!place) return buildMock(clean)
   }
+
+  const cityLabel = place?.name || 'Chennai'
 
   const [airRes, wxRes] = await Promise.allSettled([fetch(AIR(place.latitude, place.longitude)), fetch(WX(place.latitude, place.longitude))])
 
   const air = airRes.status === 'fulfilled' && airRes.value.ok ? await airRes.value.json() : null
   const wx = wxRes.status === 'fulfilled' && wxRes.value.ok ? await wxRes.value.json() : null
 
-  if (!air?.current || !Array.isArray(air?.hourly?.time)) return buildMock(clean)
+  if (!air?.current || !Array.isArray(air?.hourly?.time)) return buildMock(cityLabel)
 
   const c = air.current
   const times = air.hourly.time
   const vals = air.hourly.us_aqi
   const hourly = times.map((t, i) => ({ time: t, aqi: num(vals?.[i]) })).filter((p) => p.aqi !== null)
-  if (!hourly.length) return buildMock(clean)
+  if (!hourly.length) return buildMock(cityLabel)
 
   const nowIso = c.time ? String(c.time) : times[0]
   const current = hourly.find((p) => p.time === nowIso) || hourly[0]
